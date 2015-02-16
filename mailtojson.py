@@ -5,11 +5,17 @@
 ## https://github.com/Newsman/MailToJson
 
 import sys, urllib2, email, re, csv, StringIO, base64, json
+import datetime
+import ssdeep
+import hashlib
 from optparse import OptionParser
 
 ERROR_NOUSER = 67
 ERROR_PERM_DENIED = 77
 ERROR_TEMP_FAIL = 75
+
+# url regex from https://github.com/shiva-spampot/shiva/blob/master/analyzer/core/shivamailparser.py
+url_re = re.compile(ur'(?i)\b((?:https?://|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:\'".,<>?\xab\xbb\u201c\u201d\u2018\u2019]))')
 
 # regular expresion from https://github.com/django/django/blob/master/django/core/validators.py
 email_re = re.compile(
@@ -20,7 +26,8 @@ email_re = re.compile(
     r'|\[(25[0-5]|2[0-4]\d|[0-1]?\d?\d)(\.(25[0-5]|2[0-4]\d|[0-1]?\d?\d)){3}\]$', re.IGNORECASE)
 
 email_extract_re = re.compile("<(([.0-9a-z_+-=]+)@(([0-9a-z-]+\.)+[0-9a-z]{2,9}))>", re.M|re.S|re.I)
-filename_re = re.compile("filename=\"(.*?)\"", re.I|re.S)
+#filename_re = re.compile("filename=\"(.*?)\"", re.I|re.S)
+filename_re = re.compile("filename=\"(.+)\"|filename=([^;\n\r\"\']+)", re.I|re.S)
 
 class MailJson:
     def __init__(self, content):
@@ -93,6 +100,11 @@ class MailJson:
 
         return ret
 
+    def _get_md5sum(self, file):
+        m = hashlib.md5()
+        m.update(file)
+        return m.hexdigest()
+
     def _parse_recipients(self, v):
         if v is None:
             return None
@@ -116,6 +128,35 @@ class MailJson:
             ret.append({"name": entry, "email": e})
 
         return ret
+
+    def _parse_links(self, body):
+        links = set([group[0] for group in url_re.findall(body)])
+        mylist = list(set(links))
+
+        return mylist
+
+    def _parse_date(self, v):
+        if v is None:
+            return datetime.datetime.now()
+
+        tt = email.utils.parsedate_tz(v)
+
+        if tt is None:
+            return datetime.datetime.now()
+
+        timestamp = email.utils.mktime_tz(tt)
+        date = datetime.datetime.fromtimestamp(timestamp)
+        return date
+
+    def _get_ssdeep(self, content):
+        random = "Bacon ipsum dolor amet spare ribs tri-tip alcatra, prosciutto turkey beef ball tip hamburger capicola kielbasa meatball. Kielbasa biltong tenderloin short loin. Prosciutto pork chop ground round sirloin chicken. Short ribs tail pastrami, strip steak chicken doner jerky brisket tenderloin. Ball tip andouille venison, kevin pork loin kielbasa beef. Shank strip steak ball tip biltong bresaola, prosciutto picanha. Bacon porchetta doner chicken, rump jerky flank kielbasa turkey ball tip tongue alcatra pork chop short loin kevin. Shoulder pancetta andouille ham hock biltong jerky brisket corned beef kevin. Flank porchetta ham chicken turducken beef ham hock strip steak pork pastrami meatball t-bone boudin corned beef chuck. Doner cow rump pancetta ham hock tri-tip. Pancetta swine short ribs beef ribs jowl. T-bone pork salami, drumstick doner filet mignon hamburger short ribs picanha tenderloin. Beef ribs cupim capicola, venison shoulder fatback frankfurter meatball pork belly. Jowl swine biltong chuck filet mignon, bresaola sirloin beef kevin. Tongue ribeye chuck, strip steak chicken tail tenderloin sausage porchetta. Turkey filet mignon venison, pork belly hamburger beef ribs ball tip prosciutto doner t-bone pork."
+        
+        if len(content) < 150:
+            data = content + " " + random
+        else:
+            data = content
+
+        return ssdeep.hash(data)
 
     def _get_content_charset(self, part, failobj = None):
         """Return the charset parameter of the Content-Type header.
@@ -164,6 +205,7 @@ class MailJson:
                 headers[k] = v
 
         self.data["headers"] = headers
+        self.data["timestamp"] = self._parse_date(headers.get("date", None))
         self.data["subject"] = headers.get("subject", None)
         self.data["to"] = self._parse_recipients(headers.get("to", None))
         self.data["from"] = self._parse_recipients(headers.get("from", None))
@@ -171,6 +213,7 @@ class MailJson:
 
         attachments = []
         parts = []
+        links = []
         for part in self.msg.walk():
             if part.is_multipart():
                 continue
@@ -180,46 +223,56 @@ class MailJson:
                 # we have attachment
                 r = filename_re.findall(content_disposition)
                 if r:
-                    filename = r[0]
+                    # this returns a list with tuple with 2 values, 1 per match group
+                    filename = sorted(r[0])[1]
                 else:
                     filename = "undefined"
 
-                a = { "filename": filename, "content": base64.b64encode(part.get_payload(decode = True)), "content_type": part.get_content_type() }
+                payload = part.get_payload(decode = True)
+                a = { "filename": filename, "content":  base64.b64encode(payload), "content_type": part.get_content_type(), "md5sum": self._get_md5sum(payload) }
                 attachments.append(a)
             else:
-                p = {"content_type": part.get_content_type(), "content": unicode(part.get_payload(decode = 1), self._get_content_charset(part, "utf-8"), "ignore").encode(self.encoding) }
+                content = unicode(part.get_payload(decode = 1), self._get_content_charset(part, "utf-8"), "ignore").encode(self.encoding)
+                links.extend(self._parse_links(content))
+                p = {"content_type": part.get_content_type(), "content": content, "ssdeep": self._get_ssdeep(content) }
                 parts.append(p)
+
+        urls = []
+        for url in list(set(links)):
+            urls.append({"url": url})
 
         self.data["attachments"] = attachments
         self.data["parts"] = parts
+        self.data["links"] = urls
         self.data["encoding"] = self.encoding
 
     def getData(self):
         return self.data
 
-usage = "usage: %prog [options]"
-parser = OptionParser(usage)
-parser.add_option("-u", "--url", dest = "url", action = "store", help = "the url where to post the mail data as json")
+if __name__ == "__main__":
+    usage = "usage: %prog [options]"
+    parser = OptionParser(usage)
+    parser.add_option("-u", "--url", dest = "url", action = "store", help = "the url where to post the mail data as json")
+    
+    opt, args = parser.parse_args()
 
-opt, args = parser.parse_args()
-
-if not opt.url:
-    print parser.format_help()
-    sys.exit(1)
-
-content = sys.stdin.read()
-
-try:
-    mj = MailJson(content)
-    mj.parse()
-    data = mj.getData()
-
-    headers = {"Content-Type": "application/json; charset=%s" % data.get("encoding")}
-    req = urllib2.Request(opt.url, json.dumps(data, encoding = data.get("encoding")), headers)
-    resp = urllib2.urlopen(req)
-    ret = resp.read()
-
-    print "Parsed Mail Data sent to: %s\n" % opt.url
-except Exception, inst:
-    print "ERR: %s" % inst
-    sys.exit(ERROR_TEMP_FAIL)
+    if not opt.url:
+        print parser.format_help()
+        sys.exit(1)
+    
+    content = sys.stdin.read()
+    
+    try:
+        mj = MailJson(content)
+        mj.parse()
+        data = mj.getData()
+    
+        headers = {"Content-Type": "application/json; charset=%s" % data.get("encoding")}
+        req = urllib2.Request(opt.url, json.dumps(data, encoding = data.get("encoding")), headers)
+        resp = urllib2.urlopen(req)
+        ret = resp.read()
+    
+        print "Parsed Mail Data sent to: %s\n" % opt.url
+    except Exception, inst:
+        print "ERR: %s" % inst
+        sys.exit(ERROR_TEMP_FAIL)
